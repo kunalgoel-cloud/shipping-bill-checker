@@ -44,6 +44,7 @@ REQUIRED_FIELDS = {
 OPTIONAL_FIELDS = {
     "courier": "Courier Name",
     "customer": "Customer / Client",
+    "consignee": "Consignee Name",
     "drop_location": "Delivery Location (City)",
     "appointment_billed": "Appointment Charges (Billed amount)",
     "total_billed": "Total Charges (Billed)",
@@ -60,6 +61,8 @@ AUTO_HINTS = {
     "drop_state": ["drop state", "destination state", "to state"],
     "courier": ["courier"],
     "customer": ["client name", "customer"],
+    # "consginee" covers the common courier-sheet misspelling of "consignee".
+    "consignee": ["consignee name", "consginee name", "consignee", "consginee"],
     "drop_location": ["drop city", "destination city", "delivery city", "drop location"],
     "appointment_billed": ["appointment charges (billing)", "appointment charges billing"],
     "total_billed": ["total charges (billing)", "total charges"],
