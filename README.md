@@ -38,9 +38,15 @@ download the blank template, or reset back to Safexpress.
    (zone-to-zone rate matrix) in the **Commercial Agreement** tab to
    override the built-in one for the session. The app auto-plots the
    expected per-kg rate for each AWB based on pickup and drop state.
-4. For each AWB, add the **ideal (actual) weight** and pick
-   **Appointment / Non-Appointment** delivery from a dropdown.
-5. Click **Run Check** — AWBs where the billed rate, billed weight and
+4. Optionally filter the AWB list by **Consignee Name** and/or **Drop
+   State** to focus on a subset — only matching AWBs are listed. For each
+   one, add the **ideal (actual) weight** and pick **Appointment /
+   Non-Appointment** delivery from a dropdown. Edits are remembered per-AWB,
+   so switching or clearing the filters never loses what you've already
+   entered.
+5. Click **Run Check** — this always covers every AWB for the selected
+   courier, not just whatever the filters are currently showing. AWBs
+   where the billed rate, billed weight and
    billed appointment charge all match your inputs are marked **Approved**;
    anything that doesn't match is marked **Disputed**, with the reason
    spelled out; anything that couldn't be verified yet (e.g. no ideal

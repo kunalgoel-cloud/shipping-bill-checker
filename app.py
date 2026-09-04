@@ -19,9 +19,10 @@ st.set_page_config(page_title="Shipping Bill Checker", page_icon="\U0001F69A", l
 # --------------------------------------------------------------------------
 for key, default in {
     "working_df": None,
+    "working_file_id": None,
     "mapping": {},
     "agreement": None,
-    "editable_df": None,
+    "awb_overrides": {},  # {AWB: {"Ideal Weight (Kg)": .., "Delivery Type": ..}}
     "results_df": None,
 }.items():
     if key not in st.session_state:
@@ -68,12 +69,22 @@ with tab_checker:
     )
 
     if working_file is not None:
-        try:
-            new_df = core.read_uploaded_table(working_file)
-            st.session_state.working_df = new_df
-            st.success(f"Loaded {len(new_df)} rows, {len(new_df.columns)} columns from **{working_file.name}**.")
-        except Exception as e:
-            st.error(f"Could not read that working sheet: {e}")
+        # file_uploader keeps returning the same file across reruns until the
+        # user changes it, so only re-parse (and reset mapping/overrides) when
+        # it's actually a *different* file — otherwise every rerun would wipe
+        # out ideal-weight/delivery-type edits already entered below.
+        file_id = (working_file.name, getattr(working_file, "size", None))
+        if st.session_state.working_file_id != file_id:
+            try:
+                new_df = core.read_uploaded_table(working_file)
+                st.session_state.working_df = new_df
+                st.session_state.working_file_id = file_id
+                st.session_state.mapping = {}
+                st.session_state.awb_overrides = {}
+                st.session_state.results_df = None
+                st.success(f"Loaded {len(new_df)} rows, {len(new_df.columns)} columns from **{working_file.name}**.")
+            except Exception as e:
+                st.error(f"Could not read that working sheet: {e}")
 
     df = st.session_state.working_df
 
@@ -150,25 +161,53 @@ with tab_checker:
                 if col_name and col_name not in base.columns:
                     base[col_name] = work_df[col_name]
 
-            # Preserve previous edits (Ideal Weight / Delivery Type) across reruns when
-            # the row count/order hasn't changed; otherwise start fresh.
-            prior = st.session_state.editable_df
-            if prior is not None and len(prior) == len(base):
-                base["Ideal Weight (Kg)"] = prior.get("Ideal Weight (Kg)", pd.NA)
-                base["Delivery Type"] = prior.get(
-                    "Delivery Type", pd.Series([core.NON_APPOINTMENT] * len(base))
+            # Ideal Weight / Delivery Type are kept in a separate AWB-keyed store
+            # (st.session_state.awb_overrides) rather than on this dataframe
+            # directly, so edits survive changing the filters below — an AWB
+            # edited while one filter is applied stays edited after switching
+            # to a different filter, since it's looked up by AWB, not by row
+            # position. Delivery Type is deliberately NOT pre-filled from the
+            # courier's billed appointment amount: it's meant to be the ops
+            # user's own independent record of what was actually requested, so
+            # it can be compared against what was billed — defaulting it from
+            # the billed data itself would let every row auto-agree with the
+            # courier and mask real disputes.
+            overrides = st.session_state.awb_overrides
+            base["Ideal Weight (Kg)"] = base["AWB"].map(
+                lambda a: overrides.get(a, {}).get("Ideal Weight (Kg)", np.nan)
+            )
+            base["Delivery Type"] = base["AWB"].map(
+                lambda a: overrides.get(a, {}).get("Delivery Type", core.NON_APPOINTMENT)
+            )
+
+            # --- Filters: narrow down which AWBs are listed/edited here ---
+            filter_col1, filter_col2 = st.columns(2)
+            with filter_col1:
+                if mapping.get("consignee"):
+                    consignee_options = sorted(base["Consignee Name"].dropna().unique().tolist())
+                    selected_consignees = st.multiselect(
+                        "Filter by Consignee Name", consignee_options, key="filter_consignee"
+                    )
+                else:
+                    selected_consignees = []
+            with filter_col2:
+                drop_state_options = sorted(base["Drop State"].dropna().unique().tolist())
+                selected_drop_states = st.multiselect(
+                    "Filter by Drop State", drop_state_options, key="filter_drop_state"
                 )
-            else:
-                base["Ideal Weight (Kg)"] = np.nan
-                # Delivery Type is deliberately NOT pre-filled from the courier's billed
-                # appointment amount: this is meant to be the ops user's own independent
-                # record of what was actually requested, so it can be compared against
-                # what was billed. Defaulting it from the billed data itself would let
-                # every row auto-agree with the courier and mask real disputes.
-                base["Delivery Type"] = core.NON_APPOINTMENT
+
+            view_base = base
+            if selected_consignees:
+                view_base = view_base[view_base["Consignee Name"].isin(selected_consignees)]
+            if selected_drop_states:
+                view_base = view_base[view_base["Drop State"].isin(selected_drop_states)]
+            view_base = view_base.reset_index(drop=True)
+
+            if selected_consignees or selected_drop_states:
+                st.caption(f"Showing {len(view_base)} of {len(base)} AWBs matching the filters above.")
 
             edited = st.data_editor(
-                base,
+                view_base,
                 use_container_width=True,
                 num_rows="fixed",
                 height=420,
@@ -180,34 +219,52 @@ with tab_checker:
                         "Delivery Type", options=[core.APPOINTMENT, core.NON_APPOINTMENT], required=True
                     ),
                 },
-                disabled=[c for c in base.columns if c not in ("Ideal Weight (Kg)", "Delivery Type")],
+                disabled=[c for c in view_base.columns if c not in ("Ideal Weight (Kg)", "Delivery Type")],
                 key="awb_editor",
             )
-            st.session_state.editable_df = edited
+            # Persist whatever's currently shown back into the AWB-keyed store —
+            # only the listed/filtered AWBs are touched, everything else already
+            # entered stays exactly as it was.
+            for _, row in edited.iterrows():
+                st.session_state.awb_overrides[row["AWB"]] = {
+                    "Ideal Weight (Kg)": row["Ideal Weight (Kg)"],
+                    "Delivery Type": row["Delivery Type"],
+                }
 
             fill_col1, fill_col2 = st.columns(2)
             with fill_col1:
                 bulk_weight = st.number_input("Bulk-fill Ideal Weight for blank rows", min_value=0.0, step=0.5, value=0.0)
-                if st.button("Apply to blank rows", key="bulk_weight_btn") and bulk_weight > 0:
-                    mask = edited["Ideal Weight (Kg)"].isna()
-                    edited.loc[mask, "Ideal Weight (Kg)"] = bulk_weight
-                    st.session_state.editable_df = edited
+                if st.button("Apply to blank rows (listed above)", key="bulk_weight_btn") and bulk_weight > 0:
+                    for awb, val in zip(edited["AWB"], edited["Ideal Weight (Kg)"]):
+                        if pd.isna(val):
+                            st.session_state.awb_overrides.setdefault(awb, {})["Ideal Weight (Kg)"] = bulk_weight
                     st.rerun()
             with fill_col2:
-                bulk_delivery = st.selectbox("Bulk-set Delivery Type for all rows", [core.APPOINTMENT, core.NON_APPOINTMENT], key="bulk_delivery_sel")
-                if st.button("Apply to all rows", key="bulk_delivery_btn"):
-                    edited["Delivery Type"] = bulk_delivery
-                    st.session_state.editable_df = edited
+                bulk_delivery = st.selectbox("Bulk-set Delivery Type for all rows (listed above)", [core.APPOINTMENT, core.NON_APPOINTMENT], key="bulk_delivery_sel")
+                if st.button("Apply to all rows (listed above)", key="bulk_delivery_btn"):
+                    for awb in edited["AWB"]:
+                        st.session_state.awb_overrides.setdefault(awb, {})["Delivery Type"] = bulk_delivery
                     st.rerun()
 
             # ------------------------------------------------------------
             # Run the check
             # ------------------------------------------------------------
             st.header(f"{step_num + 1}. Run Check")
+            st.caption(
+                "Runs against every AWB for the selected courier — not just "
+                "the ones currently listed above under the filters."
+            )
 
-            # Re-attach the original mapped columns (by their real names) onto the
-            # edited table so run_checks can look them up via `mapping`.
-            run_input = edited.copy()
+            # Run Check always covers the full (unfiltered) set for this courier,
+            # re-reading the AWB-keyed overrides fresh so it includes edits made
+            # under any filter view, not just whatever's currently on screen.
+            run_input = base.copy()
+            run_input["Ideal Weight (Kg)"] = run_input["AWB"].map(
+                lambda a: st.session_state.awb_overrides.get(a, {}).get("Ideal Weight (Kg)", np.nan)
+            )
+            run_input["Delivery Type"] = run_input["AWB"].map(
+                lambda a: st.session_state.awb_overrides.get(a, {}).get("Delivery Type", core.NON_APPOINTMENT)
+            )
             rename_back = {v: k for k, v in display_cols.items()}
             run_input = run_input.rename(columns=rename_back)
 
