@@ -40,6 +40,7 @@ def new_awb_state():
         "price_source": None,    # None | "system" | "user"
         "status": core.STATUS_NOT_CHECKED,
         "reason": "",
+        "remarks": "",           # free-text note from the ops user, carried into the final sheet
     }
 
 
@@ -289,6 +290,10 @@ with tab_checker:
                     if bd is not None:
                         if bd["error"]:
                             st.error(bd["error"])
+                            wf["remarks"] = st.text_area(
+                                "Remarks (optional)", value=wf.get("remarks", ""),
+                                key=f"remarks_{awb_key}", height=80,
+                            )
                         else:
                             billed = get_billed_subtotal(row, mapping)
                             st.metric("Calculated Price", f"₹{bd['calculated_total']:,.2f}")
@@ -360,6 +365,12 @@ with tab_checker:
                                         pd.DataFrame(extra_rows, columns=["Charge", "Billed Amount"]),
                                         hide_index=True, use_container_width=True,
                                     )
+
+                            wf["remarks"] = st.text_area(
+                                "Remarks (optional)", value=wf.get("remarks", ""),
+                                key=f"remarks_{awb_key}", height=80,
+                                help="Carried into the final sheet as a Remarks column.",
+                            )
 
                             if wf["decision"] is None:
                                 ac1, ac2 = st.columns(2)
@@ -441,6 +452,7 @@ with tab_checker:
                         "Total Charges (Billed, full)": row[mapping["total_billed"]] if mapping.get("total_billed") else None,
                         "Status": status,
                         "Dispute Reasons": reason if status == core.STATUS_DISPUTED else "",
+                        "Remarks": wf.get("remarks", ""),
                     })
                 for _, row in other_courier_df.iterrows():
                     result_rows.append({
@@ -462,6 +474,7 @@ with tab_checker:
                         "Total Charges (Billed, full)": row[mapping["total_billed"]] if mapping.get("total_billed") else None,
                         "Status": core.STATUS_NOT_CHECKED,
                         "Dispute Reasons": "Different courier — no matching agreement selected",
+                        "Remarks": "",
                     })
                 st.session_state.results_df = pd.DataFrame(result_rows)
 

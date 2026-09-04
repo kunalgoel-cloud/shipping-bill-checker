@@ -48,6 +48,9 @@ download the blank template, or reset back to Safexpress.
      active agreement (see *Price formula* below) and shows it, with a
      **Show the maths** breakdown of every line item and whether it
      already matches what was billed.
+   - Optionally add a **Remarks** note (e.g. why you're overriding a
+     figure, or a follow-up needed) — carried into the final sheet as its
+     own column.
    - **Approve** that price, or **Reject** it and type in the price you
      believe is correct instead.
    - Either way, that price (system-calculated or your correction) is then
