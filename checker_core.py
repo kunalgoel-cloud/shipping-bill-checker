@@ -150,8 +150,10 @@ class Agreement:
     courier_name: str
     zone_matrix: pd.DataFrame  # index = from-zone, columns = to-zone, values = rate/kg
     zone_map: dict[str, str]  # normalised state/location -> zone
+    zone_locations: dict[str, list[str]] = field(default_factory=dict)  # zone -> original-cased locations, for display
     charges: dict[str, float] = field(default_factory=dict)
     metro_locations: list[str] = field(default_factory=list)
+    source: str = "Uploaded"  # human-readable: where this agreement came from
 
     def rate_for(self, from_zone: str, to_zone: str) -> Optional[float]:
         try:
@@ -170,6 +172,29 @@ def _normalise(s: str) -> str:
     return re.sub(r"\s+", " ", str(s).strip().lower())
 
 
+def _parse_zone_locations(rows: list[tuple[str, str]]) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """rows: (zone, "state1, state2, ...") pairs.
+
+    Returns (normalised-location -> zone lookup map, zone -> original-cased
+    locations list for display). Shared by load_agreement() and
+    default_agreement() so both build identical structures.
+    """
+    zone_map: dict[str, str] = {}
+    zone_locations: dict[str, list[str]] = {}
+    for zone, locations in rows:
+        zone = str(zone).strip()
+        locations = str(locations)
+        if not zone or locations.strip().lower() == "nan":
+            continue
+        locs = [loc.strip() for loc in locations.split(",") if loc.strip()]
+        if not locs:
+            continue
+        zone_locations[zone] = locs
+        for loc in locs:
+            zone_map[_normalise(loc)] = zone
+    return zone_map, zone_locations
+
+
 def load_agreement(uploaded_file) -> Agreement:
     """Parse the agreement workbook (see build_template() for expected layout)."""
     raw = uploaded_file.read()
@@ -180,16 +205,11 @@ def load_agreement(uploaded_file) -> Agreement:
     matrix_df.columns = [str(c).strip() for c in matrix_df.columns]
 
     mapping_df = pd.read_excel(xls, sheet_name="ZoneMapping")
-    zone_map: dict[str, str] = {}
-    for _, row in mapping_df.iterrows():
-        zone = str(row.get("Zone", "")).strip()
-        locations = str(row.get("States / Locations (comma separated)", ""))
-        if not zone or locations.lower() == "nan":
-            continue
-        for loc in locations.split(","):
-            loc = loc.strip()
-            if loc:
-                zone_map[_normalise(loc)] = zone
+    rows = [
+        (row.get("Zone", ""), row.get("States / Locations (comma separated)", ""))
+        for _, row in mapping_df.iterrows()
+    ]
+    zone_map, zone_locations = _parse_zone_locations(rows)
 
     charges_df = pd.read_excel(xls, sheet_name="Charges")
     charges: dict[str, float] = {}
@@ -205,18 +225,14 @@ def load_agreement(uploaded_file) -> Agreement:
             except (ValueError, TypeError):
                 pass
 
-    courier_name = "Unknown"
-    try:
-        meta_df = pd.read_excel(xls, sheet_name="Charges", header=None, nrows=1)
-    except Exception:
-        pass
-
     return Agreement(
-        courier_name=courier_name,
+        courier_name="Unknown",
         zone_matrix=matrix_df,
         zone_map=zone_map,
+        zone_locations=zone_locations,
         charges=charges,
         metro_locations=metro_locations,
+        source=f"Uploaded file: {getattr(uploaded_file, 'name', 'agreement.xlsx')}",
     )
 
 
@@ -264,6 +280,37 @@ _DEFAULT_CHARGES = {
 }
 
 _METRO_LOCATIONS = "Ahmedabad, Bengaluru, Chennai, Delhi, Hyderabad, Kolkata, Mumbai, Pune"
+
+
+def default_agreement() -> Agreement:
+    """The Safexpress commercial agreement, embedded directly in code (the
+    constants above) rather than requiring a file upload.
+
+    This is the agreement the app is active with from the moment it loads —
+    no setup needed. Uploading a different agreement workbook in the
+    sidebar overrides it for the session; nothing here is ever written back
+    to disk, so the built-in figures below are the single source of truth
+    for "what's the default agreement" and stay in sync with the
+    downloadable template (build_template) and the Commercial Agreement
+    view tab automatically.
+    """
+    matrix_df = pd.DataFrame(_MATRIX_VALUES, index=_ZONES, columns=_ZONES)
+    matrix_df.index.name = "From \\ To"
+
+    rows = [(z, _ZONE_LOCATIONS[z]) for z in _ZONES]
+    zone_map, zone_locations = _parse_zone_locations(rows)
+
+    metro_locations = [x.strip() for x in _METRO_LOCATIONS.split(",") if x.strip()]
+
+    return Agreement(
+        courier_name="Safexpress",
+        zone_matrix=matrix_df,
+        zone_map=zone_map,
+        zone_locations=zone_locations,
+        charges=dict(_DEFAULT_CHARGES),
+        metro_locations=metro_locations,
+        source="Built-in default (bundled in code) — Safexpress commercial agreement",
+    )
 
 
 def build_template(prefill: bool = True) -> bytes:
