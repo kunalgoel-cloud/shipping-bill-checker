@@ -296,41 +296,54 @@ with tab_checker:
                             with st.expander("🔍 Show the maths", expanded=False):
                                 st.markdown(
                                     f"**Zone:** {bd['pickup_zone']} → {bd['drop_zone']}  "
-                                    f"(Agreement Rate: ₹{bd['agreement_rate']}/Kg)"
+                                    f"(Agreement Rate: ₹{bd['agreement_rate']}/Kg, "
+                                    f"Expected Chargeable Weight: {bd['expected_weight']:.2f} Kg)"
                                 )
-                                freight_line = f"- Freight = {bd['expected_weight']:.2f} Kg × ₹{bd['agreement_rate']}/Kg = ₹{bd['raw_freight']:,.2f}"
-                                if bd["freight_floor_applied"]:
-                                    freight_line += f" → floored to **₹{bd['freight']:,.2f}** (Min Chargeable Freight)"
-                                else:
-                                    freight_line += f" = **₹{bd['freight']:,.2f}**"
-                                fov_line = f"- FOV = 0.1% of Invoice Value = ₹{bd['raw_fov']:,.2f}"
-                                if bd["fov_floor_applied"]:
-                                    fov_line += f" → floored to **₹{bd['fov']:,.2f}** (FOV Minimum)"
-                                else:
-                                    fov_line += f" = **₹{bd['fov']:,.2f}**"
-                                lines = [
-                                    f"- Expected Chargeable Weight: **{bd['expected_weight']:.2f} Kg**",
-                                    freight_line,
-                                    f"- FSC (20% of Freight): **₹{bd['fsc']:,.2f}**",
-                                    fov_line,
-                                    f"- Docket: **₹{bd['docket']:,.2f}**",
-                                    f"- Metro Congestion ({'applies' if bd['metro_applied'] else 'not applicable'}): **₹{bd['metro']:,.2f}**",
-                                    f"- Appointment ({'ABD selected' if wf['delivery_type'] == core.APPOINTMENT else 'Non-ABD'}): **₹{bd['appointment']:,.2f}**",
-                                    f"- **Calculated Total: ₹{bd['calculated_total']:,.2f}**",
-                                ]
-                                st.markdown("\n".join(lines))
 
-                                if billed is not None:
-                                    matches = abs(bd["calculated_total"] - billed) <= 1.0
-                                    if matches:
-                                        st.markdown(f"**As per commercial agreement:** ✅ Matches billed (₹{billed:,.2f})")
-                                    else:
-                                        st.markdown(
-                                            f"**As per commercial agreement:** ❌ Does not match billed "
-                                            f"(₹{billed:,.2f}, diff ₹{bd['calculated_total'] - billed:,.2f})"
-                                        )
-                                else:
-                                    st.warning("Billed component columns missing for this AWB — can't preview a match.")
+                                freight_note = f"{bd['expected_weight']:.2f} Kg × ₹{bd['agreement_rate']}/Kg = ₹{bd['raw_freight']:,.2f}"
+                                freight_note += " → floored to Min Chargeable Freight" if bd["freight_floor_applied"] else " (no floor)"
+                                fov_note = f"0.1% of Invoice Value = ₹{bd['raw_fov']:,.2f}"
+                                fov_note += " → floored to FOV Minimum" if bd["fov_floor_applied"] else " (no floor)"
+
+                                comp_rows = [
+                                    ("Freight", bd["freight"], row[mapping["freight_billed"]], freight_note),
+                                    ("FSC (20% of Freight)", bd["fsc"], row[mapping["fsc_billed"]], ""),
+                                    ("FOV", bd["fov"], row[mapping["fov_billed"]], fov_note),
+                                    ("Docket", bd["docket"], row[mapping["docket_billed"]], ""),
+                                    ("Metro Congestion", bd["metro"], row[mapping["state_charges_billed"]],
+                                     ("Metro drop — " if bd["metro_applied"] else "Not a metro drop — ")
+                                     + "billed counterpart is State Charges"),
+                                    ("Appointment", bd["appointment"], row[mapping["appointment_billed"]],
+                                     "ABD selected" if wf["delivery_type"] == core.APPOINTMENT else "Non-ABD selected"),
+                                ]
+                                comp_df = pd.DataFrame(
+                                    comp_rows, columns=["Line Item", "Calculated (₹)", "Billed — Working Sheet (₹)", "Notes"]
+                                )
+                                comp_df["Diff (₹)"] = comp_df["Calculated (₹)"] - comp_df["Billed — Working Sheet (₹)"]
+                                comp_df["Match"] = comp_df["Diff (₹)"].abs().le(0.01).map({True: "✅", False: "❌"})
+
+                                total_match = billed is not None and abs(bd["calculated_total"] - billed) <= 1.0
+                                total_row = pd.DataFrame([{
+                                    "Line Item": "Calculated Total",
+                                    "Calculated (₹)": bd["calculated_total"],
+                                    "Billed — Working Sheet (₹)": billed,
+                                    "Notes": "Sum of the six rows above, each side",
+                                    "Diff (₹)": (bd["calculated_total"] - billed) if billed is not None else None,
+                                    "Match": ("✅" if total_match else "❌") if billed is not None else "—",
+                                }])
+                                comp_df = pd.concat([comp_df, total_row], ignore_index=True)
+
+                                st.dataframe(
+                                    comp_df.style.format({
+                                        "Calculated (₹)": "₹{:,.2f}",
+                                        "Billed — Working Sheet (₹)": "₹{:,.2f}",
+                                        "Diff (₹)": "₹{:,.2f}",
+                                    }, na_rep="—"),
+                                    hide_index=True, use_container_width=True,
+                                )
+
+                                if billed is None:
+                                    st.warning("Billed component columns missing for this AWB — can't preview a total match.")
 
                                 extra_rows = []
                                 for fk in ["dhp_billed", "war_surcharge_billed", "oda_billed", "handling_billed",
