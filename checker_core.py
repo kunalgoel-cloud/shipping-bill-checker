@@ -5,8 +5,9 @@ All non-UI logic for the Shipping Bill Checker:
   - reading the courier working sheet (auto header detection)
   - reading the commercial agreement workbook (zone matrix + zone map + charges)
   - deriving zones from state names
-  - running the approve / dispute checks
-  - building the consolidated output workbook
+  - calculating the expected (agreement-side) price for an AWB
+  - comparing it against the billed subtotal to decide Approved / Disputed
+  - building the consolidated output workbook (with Disputed rows highlighted)
 
 Kept separate from app.py so the logic can be unit-tested / reused without
 Streamlit running.
@@ -20,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import pandas as pd
+from openpyxl.styles import PatternFill
 
 # --------------------------------------------------------------------------
 # Constants
@@ -32,40 +34,80 @@ STATUS_APPROVED = "Approved"
 STATUS_DISPUTED = "Disputed"
 STATUS_NOT_CHECKED = "Not Checked"
 
+DISPUTED_FILL = "FFE0E0"  # light red, used both on-screen and in the Excel export
+
 # Column names we ask the user to map from their working sheet.
+#
+# Required fields are everything the per-AWB price calculation and its
+# billed-side comparison actually need to run — without any one of these the
+# AWB can't be priced at all, so it's left "Not Checked" rather than guessed.
 REQUIRED_FIELDS = {
     "awb": "AWB Number",
-    "chargeable_weight": "Chargeable Weight (Billed)",
-    "rate_per_kg": "Rate per KG (Billed)",
     "pickup_state": "Pickup State",
     "drop_state": "Drop State",
+    "drop_location": "Delivery Location (City)",  # needed to detect metro drops
+    "invoice_value": "Invoice Value",
+    "freight_billed": "Freight Amount (Billed)",
+    "fsc_billed": "Fuel Surcharge (Billed)",
+    "fov_billed": "FOV (Billed)",
+    "docket_billed": "Docket Charges (Billed)",
+    "state_charges_billed": "State Charges (Billed)",  # billed counterpart of Metro Congestion Charge
+    "appointment_billed": "Appointment Charges (Billed)",
 }
 
+# Optional: not needed to calculate/compare the price, but used for display,
+# grouping, courier filtering, or as informational-only context in the "show
+# the maths" breakdown (charges the agreement doesn't govern at all, so they
+# never affect the Approved/Disputed decision).
 OPTIONAL_FIELDS = {
     "courier": "Courier Name",
     "customer": "Customer / Client",
     "consignee": "Consignee Name",
-    "drop_location": "Delivery Location (City)",
-    "appointment_billed": "Appointment Charges (Billed amount)",
+    "chargeable_weight": "Chargeable Weight (Billed, reference only)",
+    "rate_per_kg": "Rate per KG (Billed, reference only)",
     "total_billed": "Total Charges (Billed)",
+    "dhp_billed": "DHP (Billed, informational)",
+    "war_surcharge_billed": "War Surcharge (Billed, informational)",
+    "oda_billed": "ODA Charges (Billed, informational)",
+    "handling_billed": "Handling Charges (Billed, informational)",
+    "green_tax_billed": "Green Tax (Billed, informational)",
+    "demurrage_billed": "Demurrage Charge (Billed, informational)",
+    "other_charges_billed": "Other Charges (Billed, informational)",
 }
 
 ALL_FIELDS = {**REQUIRED_FIELDS, **OPTIONAL_FIELDS}
 
 # Fuzzy hints used to auto-suggest a column mapping from the uploaded sheet.
+# Kept deliberately specific wherever a sheet might have a same-named
+# "(Yes/No)" or otherwise unrelated column that could false-match a looser
+# hint (e.g. "ODA Charges (Yes/No)" vs "ODA Charges (Billing)", or
+# "Demurrage Days" vs "Demurrage Charge (Billing)").
 AUTO_HINTS = {
     "awb": ["awb"],
-    "chargeable_weight": ["chargeable weight"],
-    "rate_per_kg": ["rate per kg", "rate/kg", "per kg rate"],
     "pickup_state": ["pickup state", "origin state", "from state"],
     "drop_state": ["drop state", "destination state", "to state"],
+    "drop_location": ["drop city", "destination city", "delivery city", "drop location"],
+    "invoice_value": ["invoice value"],
+    "freight_billed": ["freight amount (billing)", "freight amount", "freight (billing)"],
+    "fsc_billed": ["fuel surcharge (billing)", "fuel surcharge", "fsc (billing)"],
+    "fov_billed": ["fov (billing)", "fov"],
+    "docket_billed": ["docket charges (billing)", "docket charge (billing)", "docket charges", "docket charge"],
+    "state_charges_billed": ["state charges (billing)", "state charges"],
+    "appointment_billed": ["appointment charges (billing)", "appointment charges billing"],
     "courier": ["courier"],
     "customer": ["client name", "customer"],
     # "consginee" covers the common courier-sheet misspelling of "consignee".
     "consignee": ["consignee name", "consginee name", "consignee", "consginee"],
-    "drop_location": ["drop city", "destination city", "delivery city", "drop location"],
-    "appointment_billed": ["appointment charges (billing)", "appointment charges billing"],
+    "chargeable_weight": ["chargeable weight"],
+    "rate_per_kg": ["rate per kg", "rate/kg", "per kg rate"],
     "total_billed": ["total charges (billing)", "total charges"],
+    "dhp_billed": ["dhp"],
+    "war_surcharge_billed": ["war surcharge"],
+    "oda_billed": ["oda charges (billing)", "oda (billing)"],
+    "handling_billed": ["handling charges (billing)", "handling charges", "handling (billing)"],
+    "green_tax_billed": ["green tax"],
+    "demurrage_billed": ["demurrage charge (billing)", "demurrage charges (billing)"],
+    "other_charges_billed": ["other charges"],
 }
 
 
@@ -83,7 +125,6 @@ def read_uploaded_table(uploaded_file) -> pd.DataFrame:
     """
     name = (uploaded_file.name or "").lower()
     raw_bytes = uploaded_file.read()
-    buf = io.BytesIO(raw_bytes)
 
     if name.endswith(".csv"):
         preview = pd.read_csv(io.BytesIO(raw_bytes), header=None, nrows=10, dtype=str)
@@ -169,6 +210,18 @@ class Agreement:
             return None
         key = _normalise(state_or_city)
         return self.zone_map.get(key)
+
+    def is_metro(self, city: Optional[str]) -> bool:
+        """Whether `city` counts as a metro location for congestion-charge
+        purposes. Uses a contains-match (not exact) so real-world variants
+        like "MUMBAI CITY" or "BANGALORE DELIVERY" still match "Mumbai" /
+        "Bangalore" without needing the sheet to spell the city exactly as
+        the agreement does.
+        """
+        if not city or pd.isna(city):
+            return False
+        key = _normalise(city)
+        return any(_normalise(m) in key for m in self.metro_locations if m)
 
 
 def _normalise(s: str) -> str:
@@ -271,6 +324,10 @@ _ZONE_LOCATIONS = {
     "Central": "Madhya Pradesh",
 }
 
+# "Appointment Charge Amount (Rs)" is not in the source PDF — it's derived
+# from the real working sheet, where every appointment-billed AWB carries
+# exactly ₹750, consistently, so it's used as the concrete figure the price
+# calculation adds when Appointment based Delivery is selected.
 _DEFAULT_CHARGES = {
     "Docket Charge (Flat Rs)": 100,
     "FOV Percent (%)": 0.1,
@@ -279,10 +336,13 @@ _DEFAULT_CHARGES = {
     "Min Chargeable Weight (Kg)": 15,
     "Min Chargeable Freight (Rs)": 400,
     "Metro Congestion Charge (Rs)": 100,
-    "Appointment Charge Amount (Rs, 0 = any positive value counts)": 0,
+    "Appointment Charge Amount (Rs)": 750,
 }
 
-_METRO_LOCATIONS = "Ahmedabad, Bengaluru, Chennai, Delhi, Hyderabad, Kolkata, Mumbai, Pune"
+# "Bangalore" is included alongside "Bengaluru" because real working sheets
+# commonly spell the city that way (e.g. "BANGALORE DELIVERY") — same city,
+# different common spelling, not a judgment call.
+_METRO_LOCATIONS = "Ahmedabad, Bengaluru, Bangalore, Chennai, Delhi, Hyderabad, Kolkata, Mumbai, Pune"
 
 
 def default_agreement() -> Agreement:
@@ -291,11 +351,10 @@ def default_agreement() -> Agreement:
 
     This is the agreement the app is active with from the moment it loads —
     no setup needed. Uploading a different agreement workbook in the
-    sidebar overrides it for the session; nothing here is ever written back
-    to disk, so the built-in figures below are the single source of truth
-    for "what's the default agreement" and stay in sync with the
-    downloadable template (build_template) and the Commercial Agreement
-    view tab automatically.
+    Commercial Agreement tab overrides it for the session; nothing here is
+    ever written back to disk, so the built-in figures below are the single
+    source of truth and stay in sync with the downloadable template
+    (build_template) and the Commercial Agreement view tab automatically.
     """
     matrix_df = pd.DataFrame(_MATRIX_VALUES, index=_ZONES, columns=_ZONES)
     matrix_df.index.name = "From \\ To"
@@ -355,7 +414,9 @@ def build_template(prefill: bool = True) -> bytes:
             "Instructions": [
                 "ZoneMatrix: per-kg rate from the zone in the row to the zone in the column.",
                 "ZoneMapping: list every state / location that falls in each zone.",
-                "Charges: flat/percentage charge parameters used by the optional extra checks.",
+                "Charges: flat/percentage charge parameters used by the price calculation.",
+                "Appointment Charge Amount: flat rupee amount added when Appointment based",
+                "  Delivery is selected for an AWB.",
                 "Replace the sample Safexpress figures with your own agreement, or use as-is.",
                 "Do not rename the sheet tabs (ZoneMatrix / ZoneMapping / Charges) or the tool cannot read them.",
             ]
@@ -366,7 +427,7 @@ def build_template(prefill: bool = True) -> bytes:
 
 
 # --------------------------------------------------------------------------
-# Checking logic
+# Price calculation
 # --------------------------------------------------------------------------
 
 def _num(x) -> Optional[float]:
@@ -378,144 +439,182 @@ def _num(x) -> Optional[float]:
         return None
 
 
-def run_checks(
-    df: pd.DataFrame,
-    mapping: dict[str, Optional[str]],
+def calculate_expected_price(
+    pickup_state,
+    drop_state,
+    drop_city,
+    ideal_weight,
+    delivery_type: str,
+    invoice_value,
     agreement: Agreement,
-    weight_tolerance: float = 0.0,
-    rate_tolerance: float = 0.01,
-    extra_checks: Optional[dict[str, bool]] = None,
-) -> pd.DataFrame:
-    """Return a new dataframe with computed/expected columns, per-check pass
-    flags, an overall Status, and a Dispute Reasons string.
+) -> dict:
+    """Pure calculation of the expected (agreement-side) price for one AWB.
 
-    `df` must already contain the editable "Ideal Weight (Kg)" and
-    "Delivery Type" columns added by the app.
+    Formula: Freight = max(Expected Weight × Agreement Rate/KG, Min
+    Chargeable Freight); FSC = FSC% × Freight; FOV = max(FOV% × Invoice
+    Value, FOV Minimum); Docket = flat; Metro = flat if the drop city is a
+    metro location, else 0; Appointment = flat if Appointment based Delivery
+    is selected, else 0. Calculated Total is the sum of all of these.
+
+    Returns a dict of every line item. If a required input isn't available
+    yet (no zone match, no ideal weight, no invoice value), `error` is set
+    and `calculated_total` is None — the caller should treat that AWB as
+    not yet calculable rather than guessing.
     """
-    extra_checks = extra_checks or {}
-    out = df.copy()
+    result = {
+        "pickup_zone": None, "drop_zone": None, "agreement_rate": None,
+        "expected_weight": None,
+        "freight": None, "raw_freight": None, "freight_floor_applied": False,
+        "fsc": None,
+        "fov": None, "raw_fov": None, "fov_floor_applied": False,
+        "docket": None,
+        "metro_applied": False, "metro": 0.0,
+        "appointment": 0.0,
+        "calculated_total": None,
+        "error": None,
+    }
 
-    def col(field_key):
-        name = mapping.get(field_key)
-        return out[name] if name and name in out.columns else pd.Series([None] * len(out))
-
-    pickup_state = col("pickup_state")
-    drop_state = col("drop_state")
-    billed_weight = col("chargeable_weight").map(_num)
-    billed_rate = col("rate_per_kg").map(_num)
-
-    pickup_zone, drop_zone, expected_rate = [], [], []
-    for ps, ds in zip(pickup_state, drop_state):
-        pz = agreement.zone_for(ps)
-        dz = agreement.zone_for(ds)
-        pickup_zone.append(pz)
-        drop_zone.append(dz)
-        expected_rate.append(agreement.rate_for(pz, dz) if pz and dz else None)
-
-    out["Computed Pickup Zone"] = pickup_zone
-    out["Computed Drop Zone"] = drop_zone
-    out["Agreement Rate/KG"] = expected_rate
-
-    min_weight = agreement.charges.get("Min Chargeable Weight (Kg)")
-
-    ideal_weight = out.get("Ideal Weight (Kg)", pd.Series([None] * len(out))).map(_num)
-    if min_weight is not None:
-        expected_weight = ideal_weight.map(
-            lambda w: max(w, min_weight) if w is not None else None
+    pz = agreement.zone_for(pickup_state)
+    dz = agreement.zone_for(drop_state)
+    result["pickup_zone"] = pz
+    result["drop_zone"] = dz
+    if not pz or not dz:
+        result["error"] = (
+            "Could not derive a zone for the pickup/drop state — check the "
+            "Commercial Agreement tab's Zone Mapping."
         )
-    else:
-        expected_weight = ideal_weight
-    out["Expected Chargeable Weight"] = expected_weight
+        return result
 
-    delivery_type = out.get("Delivery Type", pd.Series([None] * len(out)))
-    appt_billed_col = mapping.get("appointment_billed")
-    appt_billed = out[appt_billed_col].map(_num) if appt_billed_col and appt_billed_col in out.columns else pd.Series([None] * len(out))
+    rate = agreement.rate_for(pz, dz)
+    result["agreement_rate"] = rate
+    if rate is None:
+        result["error"] = f"No rate defined from {pz} to {dz} in the active agreement's Zone Matrix."
+        return result
 
-    statuses, reasons = [], []
-    rate_pass_l, weight_pass_l, appt_pass_l = [], [], []
+    ideal_weight_n = _num(ideal_weight)
+    if ideal_weight_n is None or ideal_weight_n <= 0:
+        result["error"] = "Enter the ideal (actual) weight first."
+        return result
 
-    for i in range(len(out)):
-        fail_reasons = []
+    invoice_value_n = _num(invoice_value)
+    if invoice_value_n is None:
+        result["error"] = "Invoice Value is missing for this AWB — needed to compute FOV."
+        return result
 
-        # --- Rate check ---
-        er, br = expected_rate[i], billed_rate.iloc[i]
-        if er is None:
-            rate_pass = None  # not checked - zone/rate unavailable
-        else:
-            rate_pass = (br is not None) and (abs(br - er) <= rate_tolerance)
-            if not rate_pass:
-                fail_reasons.append(
-                    f"Rate mismatch (billed {br if br is not None else 'NA'} vs agreement {er})"
-                )
-        rate_pass_l.append(rate_pass)
+    min_weight = agreement.charges.get("Min Chargeable Weight (Kg)") or 0
+    expected_weight = max(ideal_weight_n, min_weight)
+    result["expected_weight"] = expected_weight
 
-        # --- Weight check ---
-        ew, bw = expected_weight.iloc[i], billed_weight.iloc[i]
-        if ew is None:
-            weight_pass = None  # ideal weight not entered yet
-        else:
-            weight_pass = (bw is not None) and (abs(bw - ew) <= weight_tolerance)
-            if not weight_pass:
-                fail_reasons.append(
-                    f"Weight mismatch (billed {bw if bw is not None else 'NA'} vs expected {ew})"
-                )
-        weight_pass_l.append(weight_pass)
+    min_freight = agreement.charges.get("Min Chargeable Freight (Rs)") or 0
+    raw_freight = expected_weight * rate
+    freight = max(raw_freight, min_freight)
+    result["raw_freight"] = raw_freight
+    result["freight"] = freight
+    result["freight_floor_applied"] = freight > raw_freight + 1e-9
 
-        # --- Appointment check ---
-        dt = delivery_type.iloc[i] if i < len(delivery_type) else None
-        if not dt or appt_billed_col is None:
-            appt_pass = None  # not selected / no billed appointment column mapped
-        else:
-            ab = appt_billed.iloc[i]
-            ab_val = ab if ab is not None else 0.0
-            fixed_amt = agreement.charges.get(
-                "Appointment Charge Amount (Rs, 0 = any positive value counts)"
-            )
-            if dt == APPOINTMENT:
-                if fixed_amt:
-                    appt_pass = abs(ab_val - fixed_amt) <= 0.01
-                else:
-                    appt_pass = ab_val > 0
-            else:
-                appt_pass = ab_val == 0
-            if not appt_pass:
-                fail_reasons.append(
-                    f"Appointment charge mismatch (billed {ab_val}, expected {'>0' if dt == APPOINTMENT else '0'})"
-                )
-        appt_pass_l.append(appt_pass)
+    fsc_pct = agreement.charges.get("FSC Percent (%)") or 0
+    fsc = freight * fsc_pct / 100.0
+    result["fsc"] = fsc
 
-        # Overall status: a row can only be Approved once EVERY applicable
-        # check has actually run and passed. A check that is still None
-        # (couldn't run — e.g. no ideal weight entered yet, or no
-        # appointment-billing column mapped) must never be silently treated
-        # as "doesn't count" — otherwise a row could be marked Approved
-        # while one of its checks was never actually verified.
-        any_failed = len(fail_reasons) > 0
-        any_pending = any(c is None for c in (rate_pass, weight_pass, appt_pass))
-        if any_failed:
-            statuses.append(STATUS_DISPUTED)
-        elif any_pending:
-            statuses.append(STATUS_NOT_CHECKED)
-        else:
-            statuses.append(STATUS_APPROVED)
-        reasons.append("; ".join(fail_reasons) if fail_reasons else "")
+    fov_pct = agreement.charges.get("FOV Percent (%)") or 0
+    fov_min = agreement.charges.get("FOV Minimum (Rs)") or 0
+    raw_fov = invoice_value_n * fov_pct / 100.0
+    fov = max(raw_fov, fov_min)
+    result["raw_fov"] = raw_fov
+    result["fov"] = fov
+    result["fov_floor_applied"] = fov > raw_fov + 1e-9
 
-    out["Rate Match"] = rate_pass_l
-    out["Weight Match"] = weight_pass_l
-    out["Appointment Match"] = appt_pass_l
-    out["Status"] = statuses
-    out["Dispute Reasons"] = reasons
+    docket = agreement.charges.get("Docket Charge (Flat Rs)") or 0
+    result["docket"] = docket
 
-    return out
+    is_metro = agreement.is_metro(drop_city)
+    metro_charge = agreement.charges.get("Metro Congestion Charge (Rs)") or 0
+    metro = metro_charge if is_metro else 0.0
+    result["metro_applied"] = is_metro
+    result["metro"] = metro
 
+    appt_amt = agreement.charges.get("Appointment Charge Amount (Rs)") or 0
+    appointment = appt_amt if delivery_type == APPOINTMENT else 0.0
+    result["appointment"] = appointment
+
+    result["calculated_total"] = freight + fsc + fov + docket + metro + appointment
+    return result
+
+
+def billed_subtotal(
+    freight_billed, fsc_billed, fov_billed, docket_billed,
+    state_charges_billed, appointment_billed,
+) -> Optional[float]:
+    """Sum of the working sheet's billed components matching
+    calculate_expected_price()'s line items exactly (Freight, FSC, FOV,
+    Docket, State Charges [the Metro Congestion counterpart], Appointment).
+
+    Deliberately excludes DHP, War Surcharge, ODA, Handling, Green Tax,
+    Demurrage, and Other Charges — those aren't governed by the commercial
+    agreement, so including them would make nearly every AWB look disputed
+    regardless of whether the agreement-covered charges are correct.
+
+    Returns None if any of the six components is missing (can't compare).
+    """
+    vals = [
+        _num(x) for x in (
+            freight_billed, fsc_billed, fov_billed, docket_billed,
+            state_charges_billed, appointment_billed,
+        )
+    ]
+    if any(v is None for v in vals):
+        return None
+    return sum(vals)
+
+
+def decide_status(
+    final_price: Optional[float],
+    billed_total: Optional[float],
+    tolerance: float = 1.0,
+) -> tuple[str, str]:
+    """Compare a resolved (approved-or-user-corrected) expected price
+    against the billed subtotal. Returns (status, reason)."""
+    if final_price is None:
+        return STATUS_NOT_CHECKED, "Not yet reviewed."
+    if billed_total is None:
+        return STATUS_NOT_CHECKED, "Billed component columns missing — cannot compare."
+
+    diff = final_price - billed_total
+    if abs(diff) <= tolerance:
+        return STATUS_APPROVED, ""
+
+    direction = "over-billed by courier" if diff < 0 else "under-billed by courier"
+    reason = (
+        f"Expected ₹{final_price:,.2f} vs billed ₹{billed_total:,.2f} "
+        f"(diff ₹{abs(diff):,.2f}, {direction})"
+    )
+    return STATUS_DISPUTED, reason
+
+
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
 
 def to_download_bytes(df: pd.DataFrame, fmt: str) -> bytes:
     if fmt == "csv":
         return df.to_csv(index=False).encode("utf-8")
+
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="All AWBs", index=False)
         if "Status" in df.columns:
             df[df["Status"] == STATUS_APPROVED].to_excel(writer, sheet_name="Approved", index=False)
             df[df["Status"] == STATUS_DISPUTED].to_excel(writer, sheet_name="Disputed", index=False)
+
+        # Highlight Disputed rows on the combined "All AWBs" sheet. Approved
+        # rows are left with no special formatting, per spec.
+        if "Status" in df.columns:
+            ws = writer.sheets["All AWBs"]
+            status_col_idx = list(df.columns).index("Status") + 1  # openpyxl is 1-indexed
+            fill = PatternFill(start_color=DISPUTED_FILL, end_color=DISPUTED_FILL, fill_type="solid")
+            for row_idx in range(2, ws.max_row + 1):  # row 1 is the header
+                if ws.cell(row=row_idx, column=status_col_idx).value == STATUS_DISPUTED:
+                    for col_idx in range(1, ws.max_column + 1):
+                        ws.cell(row=row_idx, column=col_idx).fill = fill
+
     return out.getvalue()

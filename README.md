@@ -1,7 +1,9 @@
 # Shipping Bill Checker
 
-An ops tool that audits a courier working sheet (billed AWBs) against your
-commercial rate agreement, so disputes can be raised before the bill is paid.
+An ops tool that calculates the **expected price** for each AWB in a courier
+working sheet from your commercial agreement, lets you approve or correct
+that price per shipment, and compares it against what was actually billed —
+so disputes can be raised before the bill is paid.
 
 **No database. No data is stored anywhere** — everything happens in memory
 for the current browser session and disappears when the tab is closed or
@@ -17,12 +19,12 @@ download the blank template, or reset back to Safexpress.
 
 ## Tabs
 
-- **🔍 Checker** — the main workflow: upload the working sheet, review AWBs,
-  run the check, see consolidated results.
+- **🔍 Checker** — the main workflow: upload the working sheet, review AWBs
+  one at a time, run the check, see consolidated results.
 - **🗂️ Column Mapping** — confirm/override which of the working sheet's
-  columns map to AWB, Chargeable Weight, Rate/KG, etc. Auto-suggested, so
-  most sheets need no changes here at all; changes apply immediately back
-  in the Checker tab.
+  columns map to AWB, Invoice Value, the billed charge components, etc.
+  Auto-suggested, so most sheets need no changes here at all; changes apply
+  immediately back in the Checker tab.
 - **📄 Commercial Agreement** — view the currently active rate card, and
   upload/download/reset it.
 
@@ -32,35 +34,76 @@ download the blank template, or reset back to Safexpress.
    nothing to upload to get going. Check what's active any time in the
    **Commercial Agreement** tab.
 2. Upload the courier working sheet (xlsx / xls / csv) in the **Checker**
-   tab. The app reads AWB, Chargeable Weight and Rate/KG from it, using the
-   column mapping (auto-suggested, editable in the **Column Mapping** tab).
+   tab, using the column mapping (auto-suggested, editable in the **Column
+   Mapping** tab).
 3. Need a different courier's agreement? Upload your own agreement workbook
    (zone-to-zone rate matrix) in the **Commercial Agreement** tab to
-   override the built-in one for the session. The app auto-plots the
-   expected per-kg rate for each AWB based on pickup and drop state.
+   override the built-in one for the session.
 4. Optionally filter the AWB list by **Consignee Name** and/or **Drop
-   State** to focus on a subset — only matching AWBs are listed. For each
-   one, add the **ideal (actual) weight** and pick **Appointment /
-   Non-Appointment** delivery from a dropdown. Edits are remembered per-AWB,
-   so switching or clearing the filters never loses what you've already
-   entered.
+   State** to focus on a subset — only matching AWBs are listed. Each AWB
+   is its own card:
+   - Enter the **ideal (actual) weight** and pick **Appointment /
+     Non-Appointment** delivery.
+   - Click **Calculate** — the app works out the expected price from the
+     active agreement (see *Price formula* below) and shows it, with a
+     **Show the maths** breakdown of every line item and whether it
+     already matches what was billed.
+   - **Approve** that price, or **Reject** it and type in the price you
+     believe is correct instead.
+   - Either way, that price (system-calculated or your correction) is then
+     compared against the billed subtotal: matches → **Approved**;
+     doesn't → **Disputed**, with the ₹ gap shown.
+   - Edits are remembered per-AWB, so switching or clearing the filters, or
+     scrolling past a card, never loses what you've already entered.
 5. Click **Run Check** — this always covers every AWB for the selected
-   courier, not just whatever the filters are currently showing. AWBs
-   where the billed rate, billed weight and
-   billed appointment charge all match your inputs are marked **Approved**;
-   anything that doesn't match is marked **Disputed**, with the reason
-   spelled out; anything that couldn't be verified yet (e.g. no ideal
-   weight entered) is marked **Not Checked** — never silently approved.
+   courier, not just whatever the filters are currently showing. Any AWB
+   you haven't gone through the Calculate → Approve/Reject flow for yet is
+   marked **Not Checked** — never silently approved.
 6. Group the results by Customer, Delivery Location, Drop State, or
-   Consignee Name, and download the consolidated sheet as CSV or Excel
-   (with separate Approved / Disputed tabs).
+   Consignee Name. **Disputed rows are highlighted** (on-screen and in the
+   downloaded Excel) with the mismatch reason; Approved rows are left as-is.
+   Download as CSV or Excel (with separate Approved / Disputed tabs).
+
+## Price formula
+
+```
+Expected Weight   = max(Ideal Weight, Min Chargeable Weight)
+Agreement Rate/KG = ZoneMatrix[pickup zone][drop zone]      (direction matters)
+Freight           = max(Expected Weight × Agreement Rate/KG, Min Chargeable Freight)
+FSC               = FSC% × Freight
+FOV               = max(FOV% × Invoice Value, FOV Minimum)
+Docket            = flat Docket Charge
+Metro             = Metro Congestion Charge, if the drop city is a metro location, else 0
+Appointment       = Appointment Charge Amount, if Appointment based Delivery is selected, else 0
+
+Calculated Total  = Freight + FSC + FOV + Docket + Metro + Appointment
+```
+
+This is compared against the **same six components read from the working
+sheet's billed columns** (Freight, FSC, FOV, Docket, State Charges — the
+billed counterpart of Metro Congestion — and Appointment), within ₹1.
+Charges the agreement doesn't govern at all (DHP, War Surcharge, ODA,
+Handling, Green Tax, Demurrage, Other Charges) are deliberately **excluded**
+from this comparison — on real data they're billed on top of the
+agreement-covered charges regardless of whether those are correct, so
+including them would make almost every AWB look disputed. They're still
+shown in each card's "Show the maths" breakdown for reference.
+
+Two figures in the built-in Safexpress agreement aren't in the source PDF —
+they're derived from the real working sheet's own billed data, which was
+extremely consistent:
+- **Appointment Charge Amount = ₹750 flat**, seen on every appointment-billed row.
+- **Metro locations** include "Bangalore" as well as "Bengaluru" (same city,
+  common alternate spelling in courier sheets) — metro detection also uses
+  a contains-match, so "MUMBAI CITY" or "BANGALORE DELIVERY" style Drop City
+  values are still recognized.
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `app.py` | Streamlit UI / page flow (3 tabs: Checker, Column Mapping, Commercial Agreement) |
-| `checker_core.py` | Parsing, zone lookup, and the approve/dispute logic (no Streamlit dependency — easy to test on its own) |
+| `checker_core.py` | Parsing, zone lookup, price calculation, and Approved/Disputed decision logic (no Streamlit dependency — easy to test on its own) |
 | `requirements.txt` | Python dependencies |
 | `.streamlit/config.toml` | Theme + upload size limit |
 
@@ -78,8 +121,8 @@ For any other courier, download the **agreement template** from the
   each column.
 - **ZoneMapping** — which states/locations fall in each zone.
 - **Charges** — flat/percentage charge parameters (docket, FOV, FSC,
-  minimum chargeable weight, appointment charge amount, etc.) used by the
-  weight-floor and appointment checks.
+  minimum chargeable weight, minimum chargeable freight, metro congestion
+  charge, appointment charge amount) used by the price calculation above.
 
 The template ships pre-filled with the Safexpress rate card provided, so
 it works out of the box for that courier — just overwrite the numbers for
@@ -108,16 +151,18 @@ This repo is already on GitHub. To deploy:
 
 - The zone lookup is driven entirely by **Pickup State / Drop State** text
   matching the `ZoneMapping` tab. If a working sheet uses a state name or
-  abbreviation not listed there, that AWB's zone (and therefore rate
-  check) will come back blank — it's shown as "Not Checked" rather than
-  silently marked approved.
-- The weight check compares the billed **Chargeable Weight** against
-  `max(your ideal weight, Min Chargeable Weight from the agreement)` — so
-  it correctly accounts for the 15 kg floor rather than disputing every
-  small shipment.
-- The appointment check needs the working sheet's **Appointment Charges
-  (billed amount)** column mapped; if it isn't, that check is skipped
-  (shown as "Not Checked") rather than guessed.
+  abbreviation not listed there, that AWB's zone (and therefore its
+  calculated price) can't be worked out — Calculate will show an error
+  rather than a wrong number.
+- An AWB can only reach **Approved** by actually going through Calculate →
+  Approve/Reject for it. Nothing is ever inferred as a pass just because
+  another check happened to succeed.
+- The required column mapping is larger than it used to be — the price
+  calculation and its comparison both need real ₹ figures (Invoice Value,
+  and each billed charge component), not just a rate/kg and a total. If a
+  working sheet is missing one of these columns entirely, map what you can
+  in the **Column Mapping** tab; AWBs will show a "missing input" error on
+  Calculate rather than a silently wrong price.
 - If a working sheet has more than one courier, pick which courier the
-  uploaded agreement applies to — AWBs from other couriers are listed but
+  active agreement applies to — AWBs from other couriers are listed but
   marked "Not Checked" rather than compared against the wrong rate card.
