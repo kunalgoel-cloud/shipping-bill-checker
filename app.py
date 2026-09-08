@@ -236,7 +236,13 @@ with tab_checker:
                 with st.expander(f"{badge} " + " · ".join(header_bits), expanded=False):
                     ref_bits = []
                     if mapping.get("chargeable_weight") and pd.notna(row.get(mapping["chargeable_weight"])):
-                        ref_bits.append(f"Billed Chargeable Weight: {row[mapping['chargeable_weight']]} Kg")
+                        weight_bit = f"Billed Chargeable Weight: {row[mapping['chargeable_weight']]} Kg"
+                        if mapping.get("box_count") and pd.notna(row.get(mapping["box_count"])):
+                            try:
+                                weight_bit += f" ({int(row[mapping['box_count']])} boxes)"
+                            except (ValueError, TypeError):
+                                weight_bit += f" ({row[mapping['box_count']]} boxes)"
+                        ref_bits.append(weight_bit)
                     if mapping.get("rate_per_kg") and pd.notna(row.get(mapping["rate_per_kg"])):
                         ref_bits.append(f"Billed Rate/KG: ₹{row[mapping['rate_per_kg']]}")
                     if ref_bits:
@@ -299,11 +305,16 @@ with tab_checker:
                             st.metric("Calculated Price", f"₹{bd['calculated_total']:,.2f}")
 
                             with st.expander("🔍 Show the maths", expanded=False):
-                                st.markdown(
+                                rate_line = (
                                     f"**Zone:** {bd['pickup_zone']} → {bd['drop_zone']}  "
-                                    f"(Agreement Rate: ₹{bd['agreement_rate']}/Kg, "
-                                    f"Expected Chargeable Weight: {bd['expected_weight']:.2f} Kg)"
+                                    f"(Agreement Rate: ₹{bd['agreement_rate']}/Kg"
                                 )
+                                if mapping.get("rate_per_kg") and pd.notna(row.get(mapping["rate_per_kg"])):
+                                    billed_rate = float(row[mapping["rate_per_kg"]])
+                                    rate_match = abs(billed_rate - bd["agreement_rate"]) <= 0.01
+                                    rate_line += f" · Billed Rate/KG: ₹{billed_rate:g} {'✅' if rate_match else '❌'}"
+                                rate_line += f", Expected Chargeable Weight: {bd['expected_weight']:.2f} Kg)"
+                                st.markdown(rate_line)
 
                                 freight_note = f"{bd['expected_weight']:.2f} Kg × ₹{bd['agreement_rate']}/Kg = ₹{bd['raw_freight']:,.2f}"
                                 freight_note += " → floored to Min Chargeable Freight" if bd["freight_floor_applied"] else " (no floor)"
@@ -441,6 +452,8 @@ with tab_checker:
                         "Delivery Location": row[mapping["drop_location"]],
                         "Pickup State": row[mapping["pickup_state"]],
                         "Drop State": row[mapping["drop_state"]],
+                        "Billed Chargeable Weight (Kg)": row[mapping["chargeable_weight"]] if mapping.get("chargeable_weight") else None,
+                        "No of Boxes": row[mapping["box_count"]] if mapping.get("box_count") else None,
                         "Ideal Weight (Kg)": wf.get("ideal_weight"),
                         "Delivery Type": wf.get("delivery_type"),
                         "Agreement Rate/KG": bd.get("agreement_rate"),
@@ -463,6 +476,8 @@ with tab_checker:
                         "Delivery Location": row[mapping["drop_location"]],
                         "Pickup State": row[mapping["pickup_state"]],
                         "Drop State": row[mapping["drop_state"]],
+                        "Billed Chargeable Weight (Kg)": row[mapping["chargeable_weight"]] if mapping.get("chargeable_weight") else None,
+                        "No of Boxes": row[mapping["box_count"]] if mapping.get("box_count") else None,
                         "Ideal Weight (Kg)": None,
                         "Delivery Type": None,
                         "Agreement Rate/KG": None,

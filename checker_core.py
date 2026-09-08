@@ -64,6 +64,7 @@ OPTIONAL_FIELDS = {
     "customer": "Customer / Client",
     "consignee": "Consignee Name",
     "chargeable_weight": "Chargeable Weight (Billed, reference only)",
+    "box_count": "No of Boxes (Billed, reference only)",
     "rate_per_kg": "Rate per KG (Billed, reference only)",
     "total_billed": "Total Charges (Billed)",
     "dhp_billed": "DHP (Billed, informational)",
@@ -99,6 +100,7 @@ AUTO_HINTS = {
     # "consginee" covers the common courier-sheet misspelling of "consignee".
     "consignee": ["consignee name", "consginee name", "consignee", "consginee"],
     "chargeable_weight": ["chargeable weight"],
+    "box_count": ["no of boxes", "no. of boxes", "number of boxes", "box count", "no of box"],
     "rate_per_kg": ["rate per kg", "rate/kg", "per kg rate"],
     "total_billed": ["total charges (billing)", "total charges"],
     "dhp_billed": ["dhp"],
