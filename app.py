@@ -215,13 +215,23 @@ with tab_checker:
             awb_col = mapping["awb"]
 
             if courier_col:
-                couriers = sorted([c for c in work_df[courier_col].dropna().unique()])
+                courier_counts = work_df[courier_col].dropna().value_counts()
+                couriers = sorted(courier_counts.index.tolist())
                 if len(couriers) > 1:
                     st.header("2. Courier")
+                    # Default to whichever courier has the most rows in this
+                    # sheet — not alphabetically-first. A fresh session (e.g.
+                    # after a refresh) has no memory of what was previously
+                    # selected, and defaulting to the wrong courier here
+                    # filters the AWBs you were actually reviewing into
+                    # "different courier — Not Checked", which also means
+                    # cloud backup never even gets asked about them.
+                    default_index = couriers.index(courier_counts.idxmax())
                     selected_courier = st.selectbox(
                         "This agreement applies to which courier? "
                         "(other couriers' AWBs will still be listed, just marked 'Not Checked')",
                         couriers,
+                        index=default_index,
                     )
                 elif len(couriers) == 1:
                     selected_courier = couriers[0]
