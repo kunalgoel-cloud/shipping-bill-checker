@@ -45,6 +45,23 @@ def new_awb_state():
     }
 
 
+def awb_badge(wf):
+    """(emoji, label) for a card's header / status displays.
+
+    A rejected-but-not-yet-corrected AWB is its own distinct state — without
+    this it would collapse into "Not Checked", indistinguishable from an AWB
+    nobody has touched at all, which is exactly what looked like "the reject
+    got lost" after a refresh even when it hadn't.
+    """
+    if wf.get("final_price") is not None:
+        return {"Approved": ("🟢", "Approved"), "Disputed": ("🔴", "Disputed")}.get(
+            wf.get("status"), ("⚪", "Not Checked")
+        )
+    if wf.get("decision") == "rejected":
+        return "🟠", "Rejected — awaiting your corrected price"
+    return "⚪", "Not Checked"
+
+
 def highlight_disputed(row):
     if row.get("Status") == core.STATUS_DISPUTED:
         return [f"background-color: #{core.DISPUTED_FILL}"] * len(row)
@@ -298,11 +315,17 @@ with tab_checker:
                 1 for a in checkable_df[awb_col]
                 if st.session_state.awb_workflow.get(str(a), {}).get("final_price") is not None
             )
+            pending_rejection = sum(
+                1 for a in checkable_df[awb_col]
+                if (lambda w: w.get("decision") == "rejected" and w.get("final_price") is None)
+                (st.session_state.awb_workflow.get(str(a), {}))
+            )
             filter_note = f" ({len(view_df)} of {len(checkable_df)} listed under the filters above)" if (selected_consignees or selected_drop_states) else ""
+            reject_note = f" — **{pending_rejection}** rejected, awaiting corrected price" if pending_rejection else ""
             st.caption(
                 f"**{reviewed} of {len(checkable_df)}** AWB(s) reviewed"
                 + (f" for **{selected_courier}**" if selected_courier else "")
-                + filter_note + "."
+                + filter_note + reject_note + "."
             )
 
             for _, row in view_df.iterrows():
@@ -310,14 +333,16 @@ with tab_checker:
                 awb_key = str(awb)
                 wf = st.session_state.awb_workflow.setdefault(awb_key, new_awb_state())
 
-                badge = {"Approved": "🟢", "Disputed": "🔴", "Not Checked": "⚪"}[wf["status"]]
+                badge_emoji, badge_label = awb_badge(wf)
                 header_bits = [f"AWB {awb}", f"{row[mapping['pickup_state']]} → {row[mapping['drop_state']]}"]
                 if consignee_col and pd.notna(row.get(consignee_col)):
                     header_bits.append(str(row[consignee_col]))
                 if wf["final_price"] is not None:
                     header_bits.append(f"₹{wf['final_price']:,.2f}")
+                elif wf.get("decision") == "rejected":
+                    header_bits.append("rejected — awaiting corrected price")
 
-                with st.expander(f"{badge} " + " · ".join(header_bits), expanded=False):
+                with st.expander(f"{badge_emoji} " + " · ".join(header_bits), expanded=False):
                     ref_bits = []
                     if mapping.get("chargeable_weight") and pd.notna(row.get(mapping["chargeable_weight"])):
                         weight_bit = f"Billed Chargeable Weight: {row[mapping['chargeable_weight']]} Kg"
@@ -490,6 +515,10 @@ with tab_checker:
                                     st.rerun()
 
                             if wf["decision"] == "rejected" and wf["final_price"] is None:
+                                st.warning(
+                                    "🟠 Rejected — enter the price you believe is correct below, then "
+                                    "Submit. This AWB stays **Not Checked** in the final sheet until you do."
+                                )
                                 corrected = st.number_input(
                                     "Correct price (₹)", min_value=0.0, step=1.0, key=f"corr_{awb_key}"
                                 )
@@ -539,6 +568,8 @@ with tab_checker:
                     billed = get_billed_subtotal(row, mapping)
                     final_price = wf.get("final_price")
                     status, reason = core.decide_status(final_price, billed)
+                    if status == core.STATUS_NOT_CHECKED and wf.get("decision") == "rejected":
+                        reason = "Rejected — awaiting your corrected price."
                     bd = wf.get("calculated") or {}
                     result_rows.append({
                         "AWB": awb,
@@ -560,7 +591,9 @@ with tab_checker:
                         "Difference (₹)": (final_price - billed) if (final_price is not None and billed is not None) else None,
                         "Total Charges (Billed, full)": row[mapping["total_billed"]] if mapping.get("total_billed") else None,
                         "Status": status,
-                        "Dispute Reasons": reason if status == core.STATUS_DISPUTED else "",
+                        "Dispute Reasons": reason if (
+                            status == core.STATUS_DISPUTED or wf.get("decision") == "rejected"
+                        ) else "",
                         "Remarks": wf.get("remarks", ""),
                     })
                 for _, row in other_courier_df.iterrows():
