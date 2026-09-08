@@ -16,6 +16,7 @@ import pandas as pd
 import streamlit as st
 
 import checker_core as core
+import cloud_backup
 
 st.set_page_config(page_title="Shipping Bill Checker", page_icon="\U0001F69A", layout="wide")
 
@@ -50,6 +51,20 @@ def highlight_disputed(row):
     return [""] * len(row)
 
 
+def sync_awb_to_cloud(row, mapping, awb_key, wf):
+    """Best-effort upsert of one AWB's review state to the cloud backup.
+    A no-op (silently) when cloud backup isn't configured; a soft toast
+    (never a crash) if a configured backup call fails — a flaky network
+    call should never take down the review workflow itself."""
+    if not st.session_state.get("cloud_enabled"):
+        return
+    try:
+        context = cloud_backup.build_context(row, mapping)
+        cloud_backup.save_awb_state(st.session_state.cloud_client, awb_key, context, wf)
+    except Exception as e:
+        st.toast(f"⚠️ Cloud backup save failed for AWB {awb_key}: {e}", icon="⚠️")
+
+
 # --------------------------------------------------------------------------
 # Session state defaults
 # --------------------------------------------------------------------------
@@ -60,9 +75,28 @@ for key, default in {
     "agreement": None,
     "awb_workflow": {},  # {str(AWB): {...see new_awb_state()...}}
     "results_df": None,
+    "resumed_file_id": None,  # working_file_id we've already pulled cloud backup for
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
+
+# Optional cloud backup (Supabase): only the per-AWB review state (weight,
+# delivery type, decision, price, status, remarks) is backed up — the raw
+# working sheet and commercial agreement stay session-only, same as before.
+# Configure by adding SUPABASE_URL and SUPABASE_KEY to Streamlit secrets;
+# with nothing configured the app behaves exactly as it always has.
+if "cloud_enabled" not in st.session_state:
+    st.session_state.cloud_client = None
+    st.session_state.cloud_enabled = False
+    try:
+        url = st.secrets.get("SUPABASE_URL")
+        key = st.secrets.get("SUPABASE_KEY")
+        if url and key:
+            st.session_state.cloud_client = cloud_backup.get_client(url, key)
+            st.session_state.cloud_enabled = True
+    except Exception:
+        st.session_state.cloud_client = None
+        st.session_state.cloud_enabled = False
 
 # The Safexpress commercial agreement is bundled directly in checker_core.py
 # (see default_agreement()) so the app is active and usable with zero setup.
@@ -78,11 +112,19 @@ st.caption(
     "your commercial agreement, approve or correct it, and get an approve/dispute "
     "sheet — nothing is stored server-side."
 )
-st.caption(
-    "Data handling: files are processed in memory for this session only. "
-    "Closing or refreshing the tab clears everything — nothing is saved to "
-    "a database or disk."
-)
+if st.session_state.cloud_enabled:
+    st.caption(
+        "Data handling: the working sheet and commercial agreement are session-only "
+        "(gone on refresh). ☁️ **Cloud backup is connected** — each AWB's ideal weight, "
+        "delivery type, decision, price and remarks are saved as you go, so re-uploading "
+        "the same working sheet after a refresh picks up right where you left off."
+    )
+else:
+    st.caption(
+        "Data handling: files are processed in memory for this session only. "
+        "Closing or refreshing the tab clears everything — nothing is saved to "
+        "a database or disk. (Cloud backup not configured — see README to enable it.)"
+    )
 
 # ==========================================================================
 # TABS
@@ -173,6 +215,48 @@ with tab_checker:
                 checkable_mask = pd.Series([True] * len(work_df), index=work_df.index)
             checkable_df = work_df[checkable_mask].reset_index(drop=True)
             other_courier_df = work_df[~checkable_mask].reset_index(drop=True)
+
+            # ------------------------------------------------------------
+            # Resume from cloud backup (once per freshly-uploaded working
+            # sheet) — pulls back any previously saved decision/remarks for
+            # AWBs that reappear in this upload and aren't already in this
+            # session's in-memory state, and recomputes their "calculated"
+            # breakdown from the saved ideal weight/delivery type so the
+            # card looks exactly as it did before the refresh.
+            # ------------------------------------------------------------
+            if st.session_state.cloud_enabled and st.session_state.resumed_file_id != st.session_state.working_file_id:
+                try:
+                    awb_list = [str(a) for a in checkable_df[awb_col]]
+                    saved = cloud_backup.load_awb_states(st.session_state.cloud_client, awb_list)
+                    resumed_count = 0
+                    if saved:
+                        for _, row in checkable_df.iterrows():
+                            awb_key = str(row[awb_col])
+                            saved_row = saved.get(awb_key)
+                            if not saved_row or awb_key in st.session_state.awb_workflow:
+                                continue
+                            wf = new_awb_state()
+                            for f in cloud_backup.PERSISTED_FIELDS:
+                                if saved_row.get(f) is not None:
+                                    wf[f] = saved_row[f]
+                            if wf["ideal_weight"] is not None:
+                                wf["calculated"] = core.calculate_expected_price(
+                                    pickup_state=row[mapping["pickup_state"]],
+                                    drop_state=row[mapping["drop_state"]],
+                                    drop_city=row[mapping["drop_location"]],
+                                    ideal_weight=wf["ideal_weight"],
+                                    delivery_type=wf["delivery_type"],
+                                    invoice_value=row[mapping["invoice_value"]],
+                                    agreement=st.session_state.agreement,
+                                )
+                                wf["calc_inputs"] = (wf["ideal_weight"], wf["delivery_type"])
+                            st.session_state.awb_workflow[awb_key] = wf
+                            resumed_count += 1
+                    st.session_state.resumed_file_id = st.session_state.working_file_id
+                    if resumed_count:
+                        st.success(f"☁️ Resumed {resumed_count} previously-reviewed AWB(s) from cloud backup.")
+                except Exception as e:
+                    st.warning(f"Could not load cloud backup: {e}")
 
             # ------------------------------------------------------------
             # Review AWBs — filters + one card per AWB
@@ -272,6 +356,7 @@ with tab_checker:
                         wf["price_source"] = None
                         wf["status"] = core.STATUS_NOT_CHECKED
                         wf["reason"] = ""
+                        sync_awb_to_cloud(row, mapping, awb_key, wf)
 
                     if st.button("🧮 Calculate", key=f"calc_{awb_key}"):
                         breakdown = core.calculate_expected_price(
@@ -290,16 +375,20 @@ with tab_checker:
                         wf["price_source"] = None
                         wf["status"] = core.STATUS_NOT_CHECKED
                         wf["reason"] = ""
+                        sync_awb_to_cloud(row, mapping, awb_key, wf)
                         st.rerun()
 
                     bd = wf["calculated"]
                     if bd is not None:
                         if bd["error"]:
                             st.error(bd["error"])
-                            wf["remarks"] = st.text_area(
+                            new_remarks = st.text_area(
                                 "Remarks (optional)", value=wf.get("remarks", ""),
                                 key=f"remarks_{awb_key}", height=80,
                             )
+                            if new_remarks != wf.get("remarks", ""):
+                                wf["remarks"] = new_remarks
+                                sync_awb_to_cloud(row, mapping, awb_key, wf)
                         else:
                             billed = get_billed_subtotal(row, mapping)
                             st.metric("Calculated Price", f"₹{bd['calculated_total']:,.2f}")
@@ -377,11 +466,14 @@ with tab_checker:
                                         hide_index=True, use_container_width=True,
                                     )
 
-                            wf["remarks"] = st.text_area(
+                            new_remarks = st.text_area(
                                 "Remarks (optional)", value=wf.get("remarks", ""),
                                 key=f"remarks_{awb_key}", height=80,
                                 help="Carried into the final sheet as a Remarks column.",
                             )
+                            if new_remarks != wf.get("remarks", ""):
+                                wf["remarks"] = new_remarks
+                                sync_awb_to_cloud(row, mapping, awb_key, wf)
 
                             if wf["decision"] is None:
                                 ac1, ac2 = st.columns(2)
@@ -390,9 +482,11 @@ with tab_checker:
                                     wf["final_price"] = bd["calculated_total"]
                                     wf["price_source"] = "system"
                                     wf["status"], wf["reason"] = core.decide_status(wf["final_price"], billed)
+                                    sync_awb_to_cloud(row, mapping, awb_key, wf)
                                     st.rerun()
                                 if ac2.button("✏️ Reject — enter correct price", key=f"rej_{awb_key}", use_container_width=True):
                                     wf["decision"] = "rejected"
+                                    sync_awb_to_cloud(row, mapping, awb_key, wf)
                                     st.rerun()
 
                             if wf["decision"] == "rejected" and wf["final_price"] is None:
@@ -403,6 +497,7 @@ with tab_checker:
                                     wf["final_price"] = corrected
                                     wf["price_source"] = "user"
                                     wf["status"], wf["reason"] = core.decide_status(wf["final_price"], billed)
+                                    sync_awb_to_cloud(row, mapping, awb_key, wf)
                                     st.rerun()
 
                             if wf["final_price"] is not None:
@@ -423,6 +518,7 @@ with tab_checker:
                                     wf["price_source"] = None
                                     wf["status"] = core.STATUS_NOT_CHECKED
                                     wf["reason"] = ""
+                                    sync_awb_to_cloud(row, mapping, awb_key, wf)
                                     st.rerun()
 
             # ------------------------------------------------------------

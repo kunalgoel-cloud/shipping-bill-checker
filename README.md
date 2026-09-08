@@ -5,9 +5,14 @@ working sheet from your commercial agreement, lets you approve or correct
 that price per shipment, and compares it against what was actually billed —
 so disputes can be raised before the bill is paid.
 
-**No database. No data is stored anywhere** — everything happens in memory
-for the current browser session and disappears when the tab is closed or
-refreshed.
+**No permanent storage by default** — the working sheet and commercial
+agreement always live only in the browser session and disappear when the
+tab is closed or refreshed. Optionally, each AWB's *review progress*
+(ideal weight, delivery type, decision, price, status, remarks) can be
+backed up to a small Supabase table as you go — see **Cloud Backup**
+below — so re-uploading the same working sheet after a refresh resumes
+exactly where you left off instead of starting over. This is off unless
+you configure it.
 
 The **Safexpress commercial agreement** is bundled directly in the code
 (`checker_core.py` → `default_agreement()`) and is active from the moment
@@ -101,12 +106,66 @@ extremely consistent:
   a contains-match, so "MUMBAI CITY" or "BANGALORE DELIVERY" style Drop City
   values are still recognized.
 
+## Cloud Backup (optional)
+
+Off by default. When configured, every Calculate / Approve / Reject /
+Remarks action for an AWB is upserted (keyed by AWB) into a Supabase
+table, `awb_workflow`. Only the review state is saved — never the raw
+working sheet or the commercial agreement, so you still re-upload the
+working sheet after a refresh, but each AWB's card comes back exactly as
+you left it (weight, delivery type, decision, price, status, remarks, and
+the full "Show the maths" breakdown, recomputed from the saved inputs).
+
+This is built for **single-person use**: resuming matches purely by AWB
+number, with no per-user or per-batch separation. If two people (or two
+unrelated invoice batches that happen to reuse an AWB number) use the same
+table, their progress can collide.
+
+**Setup:**
+
+1. Create a Supabase project (free tier is enough for ~100 AWBs/month) at
+   [supabase.com](https://supabase.com), or use an existing one.
+2. Run this in its SQL editor:
+   ```sql
+   create table if not exists public.awb_workflow (
+     awb text primary key,
+     courier text, consignee text, pickup_state text, drop_state text,
+     delivery_location text, ideal_weight numeric, delivery_type text,
+     decision text, final_price numeric, price_source text, status text,
+     reason text, remarks text,
+     updated_at timestamptz not null default now()
+   );
+   alter table public.awb_workflow enable row level security;
+   create policy "shipping_bill_checker_anon_full_access"
+     on public.awb_workflow for all to anon using (true) with check (true);
+   ```
+   The RLS policy scopes the anon key's access to **just this table** —
+   important if the project has other tables too.
+3. In Supabase → Project Settings → API, copy the **Project URL** and the
+   **anon / publishable key**.
+4. Add them as Streamlit secrets — locally, create `.streamlit/secrets.toml`
+   (already git-ignored, never commit real credentials):
+   ```toml
+   SUPABASE_URL = "https://xxxxx.supabase.co"
+   SUPABASE_KEY = "eyJ..."
+   ```
+   On Streamlit Community Cloud: app → **Settings → Secrets**, paste the
+   same two lines.
+5. Reload the app — the caption under the title will say "☁️ Cloud backup
+   is connected" once it's picked up.
+
+**If you're reusing an existing Supabase project that has other tables**,
+double check whether Row Level Security is enabled on those too — the
+same anon key used here can read/write *any* table that doesn't have RLS
+enabled, not just this app's `awb_workflow` table.
+
 ## Files
 
 | File | Purpose |
 |---|---|
 | `app.py` | Streamlit UI / page flow (3 tabs: Checker, Column Mapping, Commercial Agreement) |
 | `checker_core.py` | Parsing, zone lookup, price calculation, and Approved/Disputed decision logic (no Streamlit dependency — easy to test on its own) |
+| `cloud_backup.py` | Optional Supabase persistence for per-AWB review state (no-ops entirely if unconfigured) |
 | `requirements.txt` | Python dependencies |
 | `.streamlit/config.toml` | Theme + upload size limit |
 
@@ -147,8 +206,10 @@ This repo is already on GitHub. To deploy:
 1. Go to [share.streamlit.io](https://share.streamlit.io), sign in with
    GitHub, click **New app**, pick this repo/branch, and set the main file
    to `app.py`.
-2. Deploy. No secrets or environment variables are required — the app has
-   no external connections at all.
+2. Deploy. No secrets are required to run the checker itself. If you want
+   the optional **Cloud Backup** (see below), add `SUPABASE_URL` and
+   `SUPABASE_KEY` under the app's **Settings → Secrets** — without them the
+   app runs exactly as before, session-only.
 
 ## Notes / things to sanity-check before rolling out to the team
 

@@ -3,3 +3,8 @@ __pycache__/
 .DS_Store
 .venv/
 venv/
+
+# Local secrets for testing the optional Supabase cloud backup — never commit
+# real credentials. On Streamlit Community Cloud, set these in the app's
+# "Secrets" settings instead (see README).
+.streamlit/secrets.toml
